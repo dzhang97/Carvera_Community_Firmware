@@ -11,6 +11,7 @@
 #include "SpindleControl.h"
 #include <stdint.h>
 #include "Pin.h"
+#include <vector>
 
 namespace mbed {
     class PwmOut;
@@ -30,7 +31,9 @@ class PWMSpindleControl: public SpindleControl {
     private:
         
         void on_pin_rise();
+        void on_pin_rise_carvera();
         uint32_t on_update_speed(uint32_t dummy);
+        uint32_t on_update_speed_carvera(uint32_t /*dummy*/);
         
         mbed::PwmOut *pwm_pin; // PWM output for spindle speed control
         mbed::InterruptIn *feedback_pin; // Interrupt pin for measuring speed
@@ -68,6 +71,10 @@ class PWMSpindleControl: public SpindleControl {
         uint32_t last_edge; // Timestamp of last edge
         volatile uint32_t last_time; // Time delay between last two edges
         volatile uint32_t irq_count;
+
+        std::vector<uint32_t> pulse_times;
+        uint32_t pulse_idx{0};
+        uint32_t total_pulse_time{0};
         
         uint32_t last_rev_time;
         volatile uint32_t rev_time;

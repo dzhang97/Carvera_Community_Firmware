@@ -26,6 +26,8 @@
 #include "port_api.h"
 #include "us_ticker_api.h"
 
+#include <numeric>
+
 #define spindle_checksum                    CHECKSUM("spindle")
 #define spindle_pwm_pin_checksum            CHECKSUM("pwm_pin")
 #define spindle_pwm_period_checksum         CHECKSUM("pwm_period")
@@ -66,6 +68,8 @@ void PWMSpindleControl::on_module_loaded()
     factor = 100;
 
     pulses_per_rev = THEKERNEL->config->value(spindle_checksum, spindle_pulses_per_rev_checksum)->by_default(1.0f)->as_number();
+    pulse_times = std::vector<uint32_t>(static_cast<uint32_t>(std::ceil(pulses_per_rev)), 0xFFFFFF);
+    total_pulse_time = std::accumulate(pulse_times.begin(), pulse_times.end(), 0);
     target_rpm = THEKERNEL->config->value(spindle_checksum, spindle_default_rpm_checksum)->by_default( 15000.0f)->as_number();
     if(CARVERA == THEKERNEL->factory_set->MachineModel) {
         max_rpm = THEKERNEL->config->value(spindle_checksum, spindle_max_rpm_checksum)->by_default(15000.0f)->as_number();
@@ -125,7 +129,10 @@ void PWMSpindleControl::on_module_loaded()
         if (smoothie_pin->port_number == 0 || smoothie_pin->port_number == 2) {
             PinName pinname = port_pin((PortName)smoothie_pin->port_number, smoothie_pin->pin);
             feedback_pin = new mbed::InterruptIn(pinname);
-            feedback_pin->rise(this, &PWMSpindleControl::on_pin_rise);
+            if (CARVERA == THEKERNEL->factory_set->MachineModel)
+                feedback_pin->rise(this, &PWMSpindleControl::on_pin_rise_carvera);
+            else
+                feedback_pin->rise(this, &PWMSpindleControl::on_pin_rise);
             NVIC_SetPriority(EINT3_IRQn, 16);
         } else {
             THEKERNEL->streams->printf("Error: Spindle feedback pin has to be on P0 or P2.\n");
@@ -135,7 +142,10 @@ void PWMSpindleControl::on_module_loaded()
         delete smoothie_pin;
     }
     
-    THEKERNEL->slow_ticker->attach(UPDATE_FREQ, this, &PWMSpindleControl::on_update_speed);
+    if (CARVERA == THEKERNEL->factory_set->MachineModel)
+        THEKERNEL->slow_ticker->attach(UPDATE_FREQ, this, &PWMSpindleControl::on_update_speed_carvera);
+    else
+        THEKERNEL->slow_ticker->attach(UPDATE_FREQ, this, &PWMSpindleControl::on_update_speed);
 }
 
 void PWMSpindleControl::on_pin_rise()
@@ -214,6 +224,69 @@ uint32_t PWMSpindleControl::on_update_speed(uint32_t dummy)
     else
         pwm_pin->write(current_pwm_value);
     
+    return 0;
+}
+
+// C1-specific interrupt handler that calculates RPM based on time between pulses instead of counting pulses per revolution, for better performance at high speed and with more pulses per rev
+void PWMSpindleControl::on_pin_rise_carvera() {
+    uint32_t timestamp = us_ticker_read();
+
+    // Calculate total_pulse_time based on last pulses_per_rev interrupts
+
+    uint32_t time_diff = timestamp - last_edge;
+
+    total_pulse_time -= pulse_times[pulse_idx];
+    total_pulse_time += time_diff;
+
+    pulse_times[pulse_idx] = time_diff;
+    last_edge = timestamp;
+
+    pulse_idx = (pulse_idx + 1) % pulse_times.size();
+
+    time_since_update = 0;
+}
+
+// C1-specific PID control
+uint32_t PWMSpindleControl::on_update_speed_carvera(uint32_t /*dummy*/) {
+    // If we don't get any interrupts for 1 second, set current RPM to 0
+    if (++time_since_update > UPDATE_FREQ) {
+    	current_rpm = 0;
+    } else {    // Calculate current RPM
+	    uint32_t t = total_pulse_time;
+	    if (t > 2000 * acc_ratio ) //RPM < 30000
+	    {	
+	        float new_rpm = 1000000 * acc_ratio * 60.0f / t;
+	        current_rpm = smoothing_decay * new_rpm + (1.0f - smoothing_decay) * current_rpm;
+	    }
+	}
+
+    if (spindle_on) {
+        float error = target_rpm * (factor / 100) - current_rpm;
+
+        if (current_pwm_value < 1.0f || error <= 0) {
+            // We are saturated at max speed, so don't increase I term to avoid windup
+            current_I_value += control_I_term * error * 1.0f / UPDATE_FREQ;
+            current_I_value = confine(current_I_value, -1.0f, 1.0f);
+        }
+
+        float new_pwm = 0.0000485 * target_rpm + 0.02; // Feed forward term, empirically derived at noload
+        new_pwm += control_P_term * error;
+        new_pwm += current_I_value;
+        new_pwm += control_D_term * (error - prev_error) * UPDATE_FREQ;
+        new_pwm = confine(new_pwm, 0.0f, max_pwm);
+
+        prev_error = error;
+        current_pwm_value = new_pwm;
+    } else {
+        current_I_value = 0;
+        current_pwm_value = 0;
+    }
+
+    if (output_inverted)
+        pwm_pin->write(1.0f - current_pwm_value);
+    else
+        pwm_pin->write(current_pwm_value);
+
     return 0;
 }
 
